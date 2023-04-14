@@ -1,0 +1,23 @@
+{
+  "name": "twitter-bot",
+  "version": "1.0.0",
+  "description": "twitter-bot",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/allaboutevemirolive/twitter-bot.git"
+  },
+  "author": "allaboutevemirolive",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/allaboutevemirolive/twitter-bot/issues"
+  },
+  "homepage": "https://github.com/allaboutevemirolive/twitter-bot#readme",
+  "dependencies": {
+    "node-fetch": "^3.3.1",
+    "playwright": "^1.32.3"
+  }
+}
