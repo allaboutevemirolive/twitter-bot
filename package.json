@@ -17,7 +17,11 @@
   },
   "homepage": "https://github.com/allaboutevemirolive/twitter-bot#readme",
   "dependencies": {
+    "crx": "^5.0.1",
+    "html2canvas": "^1.4.1",
+    "jimp": "^0.22.7",
     "node-fetch": "^3.3.1",
-    "playwright": "^1.32.3"
+    "playwright": "^1.32.3",
+    "sharp": "^0.32.0"
   }
 }
