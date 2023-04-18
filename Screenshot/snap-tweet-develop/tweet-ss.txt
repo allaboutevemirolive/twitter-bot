@@ -1,0 +1,570 @@
+
+
+
+
+
+
+
+tweet-camera.ts
+
+
+import assert from 'assert';
+import { launch, LaunchedChrome } from 'chrome-launcher';
+import CDP from 'chrome-remote-interface';
+import exitHook from 'exit-hook';
+import {
+	querySelector,
+	waitForNetworkIdle,
+	hideNode,
+	screenshotNode,
+} from './cdp-utils';
+
+interface Options {
+	width?: number;
+	darkMode?: boolean;
+	showThread?: boolean;
+	locale?: string;
+}
+
+const getEmbeddableTweetUrl = (tweetId: string, options: Options) => {
+	const embeddableTweetUrl = new URL('https://platform.twitter.com/embed/Tweet.html');
+	const searchParameters = {
+		id: tweetId,
+		theme: options.darkMode ? 'dark' : 'light',
+		hideThread: options.showThread ? 'false' : 'true',
+		lang: options.locale ?? 'en',
+
+		// Not sure what these do but pass them in anyway (Reference: https://publish.twitter.com/)
+		embedId: 'twitter-widget-0',
+		features: 'eyJ0ZndfZXhwZXJpbWVudHNfY29va2llX2V4cGlyYXRpb24iOnsiYnVja2V0IjoxMjA5NjAwLCJ2ZXJzaW9uIjpudWxsfSwidGZ3X2hvcml6b25fdHdlZXRfZW1iZWRfOTU1NSI6eyJidWNrZXQiOiJodGUiLCJ2ZXJzaW9uIjpudWxsfX0=',
+		frame: 'false',
+		hideCard: 'false',
+		sessionId: '4ee57c34a8bc3f4118cee97a9904f889f35e29b4',
+		widgetsVersion: '82e1070:1619632193066',
+	};
+
+	// eslint-disable-next-line guard-for-in
+	for (const key in searchParameters) {
+		embeddableTweetUrl.searchParams.set(key, searchParameters[key]);
+	}
+
+	return embeddableTweetUrl.toString();
+};
+
+const waitForTweetLoad = Network => new Promise<void>((resolve, reject) => {
+	Network.responseReceived(({ type, response }) => {
+		if (
+			type === 'XHR'
+			&& response.url.startsWith('https://cdn.syndication.twimg.com/tweet')
+		) {
+			if (response.status === 200) {
+				return resolve();
+			}
+
+			if (response.status === 404) {
+				return reject(new Error('Tweet not found'));
+			}
+
+			reject(new Error(`Failed to fetch tweet: ${response.status}`));
+		}
+	});
+});
+
+class TweetCamera {
+	chrome: LaunchedChrome;
+
+	initializingChrome: Promise<any>;
+
+	constructor() {
+		this.initializingChrome = this.initializeChrome();
+	}
+
+	async initializeChrome() {
+		const chrome = await launch({
+			chromeFlags: [
+				'--headless',
+				'--disable-gpu',
+			],
+		});
+
+		exitHook(() => {
+			chrome.kill();
+		});
+
+		this.chrome = chrome;
+
+		const browserClient = await CDP({
+			port: chrome.port,
+		});
+
+		return browserClient;
+	}
+
+	static parseTweetUrl(tweetUrl: string) {
+		assert(tweetUrl, 'Tweet URL must be passed in');
+		const [, username, tweetId] = tweetUrl.match(/twitter.com\/(\w{1,15})\/status\/(\d+)/) ?? [];
+
+		assert(
+			username && tweetId,
+			`Invalid Tweet URL: ${tweetUrl}`,
+		);
+
+		return {
+			username,
+			tweetId,
+		};
+	}
+
+	static getRecommendedFileName(
+		username: string,
+		tweetId: string,
+		options: Options = {},
+	) {
+		const nameComponents = [username, tweetId];
+
+		if (options.width !== 550) {
+			nameComponents.push(`w${options.width}`);
+		}
+
+		if (options.showThread) {
+			nameComponents.push('thread');
+		}
+
+		if (options.darkMode) {
+			nameComponents.push('dark');
+		}
+
+		if (options.locale !== 'en') {
+			nameComponents.push(options.locale);
+		}
+
+		return `${nameComponents.join('-')}.png`;
+	}
+
+	async snapTweet(
+		tweetId: string,
+		options: Options = {},
+	) {
+		const browserClient = await this.initializingChrome;
+		const { targetId } = await browserClient.Target.createTarget({
+			url: getEmbeddableTweetUrl(tweetId, options),
+			width: options.width ?? 550,
+			height: 1000,
+		});
+
+		const client = await CDP({
+			port: this.chrome.port,
+			target: targetId,
+		});
+
+		await client.Network.enable();
+
+		await waitForTweetLoad(client.Network);
+
+		await waitForNetworkIdle(client.Network, 200);
+
+		const { root } = await client.DOM.getDocument();
+		const tweetContainerNodeId = await querySelector(client.DOM, root.nodeId, '#app > div > div > div:last-child');
+
+		// "Copy link to Tweet" button
+		const hideCopyLinkButtonNodeId = await querySelector(client.DOM, tweetContainerNodeId, '[role="button"]').catch(() => null);
+
+		await Promise.all([
+			// "Copy link to Tweet" button
+			(hideCopyLinkButtonNodeId && hideNode(client.DOM, hideCopyLinkButtonNodeId)),
+
+			// Info button - can't use aria-label because of i18n
+			hideNode(
+				client.DOM,
+				await querySelector(
+					client.DOM,
+					tweetContainerNodeId,
+					'a[href$="twitter-for-websites-ads-info-and-privacy"]',
+				),
+			),
+
+			// Remove the "Read 10K replies" button
+			client.DOM.removeNode({
+				nodeId: await querySelector(
+					client.DOM,
+					tweetContainerNodeId,
+					'.css-1dbjc4n.r-kzbkwu.r-1h8ys4a',
+				),
+			}),
+
+			// Unset max-width to fill window width
+			client.DOM.setAttributeValue({
+				nodeId: tweetContainerNodeId,
+				name: 'style',
+				value: 'max-width: unset',
+			}),
+
+			// Set transparent bg for screenshot
+			client.Emulation.setDefaultBackgroundColorOverride({
+				color: {
+					r: 0, g: 0, b: 0, a: 0,
+				},
+			}),
+		]);
+
+		// If the width is larger than default, a larger image might get requested
+		if (options.width > 550) {
+			await waitForNetworkIdle(client.Network, 200);
+		}
+
+		// Screenshot only the tweet
+		const snapshot = await screenshotNode(client.Page, client.DOM, tweetContainerNodeId);
+
+		client.Target.closeTarget({
+			targetId,
+		});
+
+		return snapshot;
+	}
+
+	async close() {
+		const browserClient = await this.initializingChrome;
+		await browserClient.close();
+		await this.chrome.kill();
+	}
+}
+
+export default TweetCamera;
+
+
+
+
+
+
+
+
+
+
+render-task-runner.tsx
+
+
+
+
+// eslint-disable-line unicorn/filename-case
+import React, { ComponentProps, useReducer, FC } from 'react';
+import { render } from 'ink';
+import { TaskList, Task } from 'ink-task-list';
+
+interface Task {
+	label: string;
+	state: ComponentProps<typeof Task>['state'];
+}
+
+const CliSnapTweet: FC<{
+	items: Task[];
+}> = ({ items }) => (
+	<TaskList>
+		{
+			items.map((item, index) => (
+				<Task
+					key={index}
+					label={item.label}
+					state={item.state}
+				/>
+			))
+		}
+	</TaskList>
+);
+
+const reducer = (state: Task[], task: 'task-updated' | Task) => {
+	if (task === 'task-updated') {
+		return state.slice();
+	}
+	return [...state, task];
+};
+
+function renderTaskRunner() {
+	let items;
+	let dispatchAction;
+	render(React.createElement(() => {
+		[items, dispatchAction] = useReducer(reducer, []);
+		return React.createElement(CliSnapTweet, { items });
+	}));
+
+	return function addTask(label: string) {
+		const task = {
+			label,
+			state: 'loading',
+		};
+		dispatchAction(task);
+
+		return {
+			success(message) {
+				task.label = message;
+				task.state = 'success';
+
+				dispatchAction('task-updated');
+			},
+			error(message) {
+				task.label = message;
+				task.state = 'error';
+
+				dispatchAction('task-updated');
+			},
+		};
+	};
+}
+
+export default renderTaskRunner;
+
+
+
+
+
+
+
+
+
+
+
+
+
+cli.ts
+
+
+
+import fs from 'fs';
+import path from 'path';
+import { unusedFilename } from 'unused-filename';
+import tempy from 'tempy';
+import open from 'open';
+import { cli } from 'cleye';
+import renderTaskRunner from './render-task-runner';
+import TweetCamera from './tweet-camera';
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { version } = require('../package.json');
+
+const argv = cli({
+	name: 'snap-tweet',
+
+	version,
+
+	parameters: ['<tweet urls...>'],
+
+	flags: {
+		outputDir: {
+			type: String,
+			alias: 'o',
+			description: 'Tweet screenshot output directory',
+			placeholder: '<path>',
+		},
+		width: {
+			type: Number,
+			alias: 'w',
+			description: 'Width of tweet',
+			default: 550,
+			placeholder: '<width>',
+		},
+		showThread: {
+			type: Boolean,
+			alias: 't',
+			description: 'Show tweet thread',
+		},
+		darkMode: {
+			type: Boolean,
+			alias: 'd',
+			description: 'Show tweet in dark mode',
+		},
+		locale: {
+			type: String,
+			description: 'Locale',
+			default: 'en',
+			placeholder: '<locale>',
+		},
+	},
+
+	help: {
+		examples: [
+			'# Snapshot a tweet',
+			'snap-tweet https://twitter.com/jack/status/20',
+			'',
+			'# Snapshot a tweet with Japanese locale',
+			'snap-tweet https://twitter.com/TwitterJP/status/578707432 --locale ja',
+			'',
+			'# Snapshot a tweet with dark mode and 900px width',
+			'snap-tweet https://twitter.com/Interior/status/463440424141459456 --width 900 --dark-mode',
+		],
+	},
+});
+
+(async () => {
+	const options = argv.flags;
+	const tweets = argv._.tweetUrls
+		.map(
+			tweetUrl => ({
+				...TweetCamera.parseTweetUrl(tweetUrl),
+				tweetUrl,
+			}),
+		)
+		.filter(
+			// Deduplicate
+			(tweet, index, allTweets) => {
+				const index2 = allTweets.findIndex(t => t.tweetId === tweet.tweetId);
+				return index === index2;
+			},
+		);
+
+	const tweetCamera = new TweetCamera();
+	const startTask = renderTaskRunner();
+
+	await Promise.all(tweets.map(async ({
+		tweetId,
+		username,
+		tweetUrl,
+	}) => {
+		const task = startTask(`📷 Snapping tweet #${tweetId} by @${username}`);
+
+		try {
+			const snapshot = await tweetCamera.snapTweet(tweetId, options);
+			const recommendedFileName = TweetCamera.getRecommendedFileName(
+				username,
+				tweetId,
+				options,
+			);
+			const fileName = `snap-tweet-${recommendedFileName}`;
+
+			if (options.outputDir) {
+				const filePath = await unusedFilename(path.resolve(options.outputDir, fileName));
+				await fs.promises.writeFile(filePath, snapshot);
+
+				task.success(`📸 Tweet #${tweetId} by @${username} saved to ${filePath}`);
+			} else {
+				const filePath = tempy.file({
+					name: fileName,
+				});
+				await fs.promises.writeFile(filePath, snapshot);
+				open(filePath);
+
+				task.success(`📸 Snapped tweet #${tweetId} by @${username}`);
+			}
+		} catch (error) {
+			task.error(`${error.message}: ${tweetUrl}`);
+		}
+	}));
+
+	await tweetCamera.close();
+})().catch((error) => {
+	if (error.code === 'ERR_LAUNCHER_NOT_INSTALLED') {
+		console.log(
+			'[snap-tweet] Error: Chrome could not be automatically found! Manually pass in the Chrome binary path with the CHROME_PATH environment variable: CHROME_PATH=/path/to/chrome npx snap-tweet ...',
+		);
+	} else {
+		console.log('[snap-tweet] Error:', error.message);
+	}
+	process.exit(1);
+});
+
+
+
+
+
+
+
+cdp-utils.ts
+
+
+
+import pRetry from 'p-retry';
+
+export const waitForNetworkIdle = (
+	Network,
+	waitFor: number,
+): Promise<void> => new Promise((resolve) => {
+	const trackRequests = new Set();
+	let resolvingTimeout = setTimeout(resolve, waitFor);
+
+	Network.requestWillBeSent(({ requestId }) => {
+		trackRequests.add(requestId);
+		clearTimeout(resolvingTimeout);
+	});
+
+	Network.loadingFinished(({ requestId }) => {
+		trackRequests.delete(requestId);
+		if (trackRequests.size === 0) {
+			resolvingTimeout = setTimeout(resolve, waitFor);
+		}
+	});
+});
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => {
+	setTimeout(resolve, ms);
+});
+
+export const querySelector = async (
+	DOM,
+	contextNodeId: number,
+	selector: string,
+) => await pRetry(
+	async () => {
+		const { nodeId } = await DOM.querySelector({
+			nodeId: contextNodeId,
+			selector,
+		});
+
+		if (nodeId === 0) {
+			throw new Error(`Selector "${selector}" not found`);
+		}
+
+		return nodeId as number;
+	},
+	{
+		retries: 3,
+		onFailedAttempt: async () => await sleep(100),
+	},
+);
+
+export const xpath = async (
+	DOM,
+	query: string,
+) => {
+	const { searchId, resultCount } = await DOM.performSearch({ query });
+	const { nodeIds } = await DOM.getSearchResults({
+		searchId,
+		fromIndex: 0,
+		toIndex: resultCount,
+	});
+
+	return nodeIds as number[];
+};
+
+export const hideNode = async (
+	DOM,
+	nodeId: number,
+) => {
+	await DOM.setAttributeValue({
+		nodeId,
+		name: 'style',
+		value: 'visibility: hidden',
+	});
+};
+
+export const screenshotNode = async (
+	Page,
+	DOM,
+	nodeId: number,
+) => {
+	try {
+		const { model } = await DOM.getBoxModel({ nodeId });
+		const screenshot = await Page.captureScreenshot({
+			clip: {
+				x: 0,
+				y: 0,
+				width: model.width,
+				height: model.height,
+				scale: 1,
+			},
+		});
+
+		return Buffer.from(screenshot.data, 'base64');
+	} catch (error) {
+		console.log(error);
+		throw new Error('Failed to take a snapshot');
+	}
+};
+
